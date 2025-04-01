@@ -1,11 +1,17 @@
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union, Type
+from market_agents.agents.market_agent import MarketAgent
+from market_agents.orchestrators.logger_utils import log_cohort_formation
 from market_agents.orchestrators.config import EnvironmentConfig
 from market_agents.environments.mechanisms.mcp_server import MCPServerEnvironmentConfig, MCPServerMechanism
 from pydantic import BaseModel, Field
 import pandas as pd
 import numpy as np
 from dateutil.relativedelta import relativedelta
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 from market_agents.environments.environment import (
     LocalEnvironmentStep,
@@ -24,7 +30,7 @@ class BacktestingEnvironmentConfig(EnvironmentConfig):
     """Configuration for backtesting environment"""
     name: str = Field(default="backtesting", description="Name of the backtesting environment")
     mechanism: str = Field(default="backtesting", description="Type of mechanism")
-    tickers: List[str] = Field(..., description="List of ticker symbols to backtest")
+    assets: List[str] = Field(..., description="List of assets to backtest")
     start_date: str = Field(..., description="Start date for backtesting in YYYY-MM-DD format")
     end_date: str = Field(..., description="End date for backtesting in YYYY-MM-DD format")
     initial_capital: float = Field(..., description="Initial capital for the portfolio")
@@ -42,7 +48,7 @@ class BacktestingEnvironmentConfig(EnvironmentConfig):
 # Trade action schema
 class TradeAction(BaseModel):
     """Schema for trade actions"""
-    ticker: str = Field(..., description="The ticker symbol to trade")
+    asset: str = Field(..., description="The asset symbol to trade")
     action: str = Field(..., description="Trade action: buy, sell, short, or cover")
     quantity: float = Field(..., description="Number of shares to trade")
     reason: str = Field(default="", description="Reasoning behind the trade")
@@ -57,7 +63,7 @@ class BacktestAction(LocalAction):
         return cls(
             agent_id=agent_id,
             action=TradeAction(
-                ticker="SAMPLE",
+                asset="SAMPLE",
                 action="hold",
                 quantity=0,
                 reason="Sample trade"
@@ -185,7 +191,7 @@ class BacktestDataProvider:
 class BacktestingMechanism(Mechanism):
     """Mechanism that manages backtesting simulation with integrated trade execution"""
     sequential: bool = Field(default=False)
-    tickers: List[str] = Field(default_factory=list)
+    assets: List[str] = Field(default_factory=list)
     dates: List[datetime] = Field(default_factory=list)
     current_index: int = Field(default=0)
     portfolio: Dict[str, Any] = Field(default_factory=dict)
@@ -211,30 +217,36 @@ class BacktestingMechanism(Mechanism):
 
     def __init__(
         self,
-        tickers: List[str],
+        assets: List[str],
         start_date: str,
         end_date: str,
         initial_capital: float,
         margin_requirement: float = 0.0,
-        form_cohorts: bool = False,
-        group_size: int = 4,
+        form_cohorts: bool = True,
+        cohort_type: str = "asset",
         **kwargs
     ):
-        """Initialize the backtesting mechanism"""
         super().__init__(
             form_cohorts=form_cohorts,
             **kwargs
         )
         
-        self.tickers = tickers
+        self.assets = assets 
+        self.cohort_type = cohort_type
         self.dates = pd.date_range(start_date, end_date, freq='B')
+        self.current_index = 0
         self.data_provider = BacktestDataProvider()
 
+        self.cohorts = {}
+
+        # Initialize market data structure per asset
         self.market_data = {
-            "date": self.dates[0].strftime("%Y-%m-%d") if len(self.dates) > 0 else None,
-            "prices": {ticker: 0.0 for ticker in tickers},  # Default zero prices until updated
-            "metrics": {},
-            "news": []
+            asset: {
+                "date": self.dates[0].strftime("%Y-%m-%d") if len(self.dates) > 0 else None,
+                "price": 0.0,
+                "metrics": {},
+                "news": []
+            } for asset in assets
         }
         
         # Initialize portfolio with support for long/short positions
@@ -243,31 +255,211 @@ class BacktestingMechanism(Mechanism):
             "margin_used": 0.0,
             "margin_requirement": margin_requirement,
             "positions": {
-                ticker: {
+                asset: {
                     "long": 0,
                     "short": 0,
                     "long_cost_basis": 0.0,
                     "short_cost_basis": 0.0,
                     "short_margin_used": 0.0
-                } for ticker in tickers
+                } for asset in assets
             },
             "realized_gains": {
-                ticker: {
+                asset: {
                     "long": 0.0,
                     "short": 0.0,
-                } for ticker in tickers
+                } for asset in assets
             }
         }
 
-        # Initialize portfolio values with initial capital
-        if len(self.dates) > 0:
-            self.portfolio_values = [{
-                "Date": self.dates[0],
-                "Portfolio Value": initial_capital
-            }]
+        # Initialize data storage for prefetched data per asset
+        self.price_data = {asset: pd.DataFrame() for asset in assets}
+        self.fundamental_data = {asset: {} for asset in assets}
+        self.financial_data = {asset: {} for asset in assets}
+        self.news_data = {asset: [] for asset in assets}
         
-        # Pre-fetch data
-        self.prefetch_data()
+        # Track decisions and context per asset
+        self.global_decisions = {asset: [] for asset in assets}
+        self.global_context = {
+            asset: {
+                "last_round_actions": {},
+                "portfolio_state": self.portfolio,
+                "market_state": self.market_data[asset]
+            } for asset in assets
+        }
+        
+        # Performance tracking per asset
+        self.performance_metrics = {
+            asset: {
+                "sharpe_ratio": 0.0,
+                "sortino_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "max_drawdown_date": None,
+                "win_rate": 0.0,
+                "specific_metrics": {}
+            } for asset in assets
+        }
+
+    async def form_agent_cohorts(self, agents: List[Any]) -> None:
+        """Form cohorts based on assets with new agent instances for memory isolation"""
+        self.cohorts.clear()
+        
+        if not self.form_cohorts:
+            return
+        
+        logger.info(f"Forming asset-based cohorts with new agent instances")
+        
+        # Load storage config for creating agent memory tables
+        from market_agents.memory.config import load_config_from_yaml
+        from market_agents.memory.agent_storage.agent_storage_api_utils import AgentStorageAPIUtils
+        from market_agents.memory.memory import ShortTermMemory, LongTermMemory
+        
+        storage_config = load_config_from_yaml("market_agents/memory/storage_config.yaml")
+        storage_utils = AgentStorageAPIUtils(config=storage_config)
+        
+        # Create a cohort for each asset
+        for asset in self.assets:
+            asset_agents = []
+            
+            for agent in agents:
+                # Create a new agent ID for this asset cohort
+                asset_agent_id = f"{agent.id}_{asset}"
+                
+                try:
+                    # Import MarketAgent
+                    from market_agents.agents.market_agent import MarketAgent
+                    
+                    # Initialize memory the same way MarketAgent.create() does
+                    stm = ShortTermMemory(
+                        agent_id=asset_agent_id,
+                        agent_storage_utils=storage_utils,
+                        default_top_k=storage_utils.config.stm_top_k
+                    )
+                    await stm.initialize()
+                    
+                    ltm = LongTermMemory(
+                        agent_id=asset_agent_id,
+                        agent_storage_utils=storage_utils,
+                        default_top_k=storage_utils.config.ltm_top_k
+                    )
+                    await ltm.initialize()
+                    
+                    # Create the agent instance directly using the constructor
+                    from minference.lite.inference import InferenceOrchestrator
+                    
+                    # Get the role directly from the agent
+                    role = getattr(agent, 'role', "Market Agent")
+                    
+                    # Create the new agent
+                    asset_agent = MarketAgent(
+                        id=asset_agent_id,
+                        short_term_memory=stm,
+                        long_term_memory=ltm,
+                        llm_orchestrator=InferenceOrchestrator(),
+                        role=role,  # Use the role directly, avoiding persona.role
+                        persona=agent.persona,  # Pass the original persona
+                        llm_config=getattr(agent, 'llm_config', None),
+                        economic_agent=getattr(agent, 'economic_agent', None)
+                    )
+                    
+                    # Copy over task and tools
+                    if hasattr(agent, 'task'):
+                        asset_agent.task = f"Analyze and trade {asset}: {agent.task}"
+                    else:
+                        asset_agent.task = f"Analyze and trade {asset}"
+                    
+                    if hasattr(agent, 'tools'):
+                        asset_agent.tools = agent.tools
+                    
+                    # IMPORTANT: Copy over environment references
+                    if hasattr(agent, 'environments'):
+                        asset_agent.environments = agent.environments
+                    
+                    # Add to the asset's cohort
+                    asset_agents.append(asset_agent)
+                    
+                except Exception as e:
+                    logger.error(f"Error creating agent for {asset}: {e}", exc_info=True)
+                    continue
+            
+            # Save this asset's cohort with unique agent instances
+            self.cohorts[asset] = asset_agents
+            
+            # Initialize asset-specific tracking
+            if asset not in self.global_decisions:
+                self.global_decisions[asset] = []
+            
+            # Log cohort formation
+            agent_ids = [a.id for a in asset_agents]
+            log_cohort_formation(logger, asset, agent_ids)
+        
+        logger.info(f"Formed {len(self.cohorts)} asset-based cohorts")
+        for asset, cohort_agents in self.cohorts.items():
+            agent_ids = [a.id for a in cohort_agents]
+            logger.info(f"  {asset}: {agent_ids}")
+
+    def _create_observation(self, asset: Optional[str] = None) -> BacktestObservation:
+        """Create observation from current state, filtered by asset"""
+        if asset:
+            # Filter market data for specific asset
+            filtered_market_data = {
+                "date": self.market_data["date"],
+                "prices": {asset: self.market_data["prices"].get(asset)},
+                "metrics": {asset: self.market_data["metrics"].get(asset)},
+                "news": [n for n in self.market_data["news"] if n.get('asset') == asset]
+            }
+            
+            # Filter portfolio data for specific asset
+            filtered_portfolio = {
+                "cash": self.portfolio["cash"],  # Cash is shared across all assets
+                "margin_requirement": self.portfolio["margin_requirement"],
+                "margin_used": self.portfolio["margin_used"],
+                "positions": {
+                    asset: self.portfolio["positions"][asset]
+                },
+                "realized_gains": {
+                    asset: self.portfolio["realized_gains"][asset]
+                }
+            }
+            
+            return BacktestObservation(
+                market_data=MarketData(**filtered_market_data),
+                portfolio=PortfolioState(**filtered_portfolio),
+                performance_metrics={asset: self.performance_metrics[asset]}
+            )
+        else:
+            return BacktestObservation(
+                market_data=MarketData(**self.market_data),
+                portfolio=PortfolioState(**self.portfolio),
+                performance_metrics=self.performance_metrics
+            )
+
+    def _create_step(self, done: bool, cohort_id: Optional[str] = None) -> EnvironmentStep:
+        """Create a global step with asset-specific observations"""
+        observations = {}
+        
+        if cohort_id and cohort_id in self.cohorts:
+            agents = self.cohorts[cohort_id]
+            # Create asset-specific observation
+            obs = self._create_observation(asset=cohort_id)
+            
+            # Create observation for each agent in the cohort
+            for agent in agents:
+                observations[agent.id] = BacktestLocalObservation(
+                    agent_id=agent.id,
+                    observation=obs
+                )
+
+        return EnvironmentStep(
+            global_observation=BacktestGlobalObservation(
+                observations=observations,
+                all_actions_this_round=None
+            ),
+            done=done,
+            info={
+                "date": self.market_data["date"],
+                "asset": cohort_id
+            }
+        )
 
     async def prefetch_data(self):
         """Pre-fetch all data needed for the backtest period"""
@@ -276,38 +468,38 @@ class BacktestingMechanism(Mechanism):
         start_date_str = self.dates[0].strftime("%Y-%m-%d")
         end_date_str = self.dates[-1].strftime("%Y-%m-%d")
 
-        for ticker in self.tickers:
+        for asset in self.assets:
             try:
                 # Get historical prices for the entire period
                 prices = await self.data_provider.get_historical_prices(
-                    ticker, start_date_str, end_date_str
+                    asset, start_date_str, end_date_str
                 )
                 if prices:
-                    self.price_data[ticker] = self.data_provider.convert_prices_to_df(prices)
+                    self.price_data[asset] = self.data_provider.convert_prices_to_df(prices)
 
                 # Get fundamentals as of the start date
                 fundamentals = await self.data_provider.get_historical_fundamentals(
-                    ticker, start_date_str
+                    asset, start_date_str
                 )
                 if fundamentals:
-                    self.fundamental_data[ticker] = fundamentals
+                    self.fundamental_data[asset] = fundamentals
 
                 # Get financial data
                 financials = await self.data_provider.get_historical_financials(
-                    ticker, end_date_str
+                    asset, end_date_str
                 )
                 if financials:
-                    self.financial_data[ticker] = financials
+                    self.financial_data[asset] = financials
 
                 # Get historical news
                 news = await self.data_provider.get_historical_news(
-                    ticker, start_date_str, end_date_str
+                    asset, start_date_str, end_date_str
                 )
                 if news:
-                    self.news_data[ticker] = news
+                    self.news_data[asset] = news
 
             except Exception as e:
-                print(f"Error prefetching data for {ticker}: {e}")
+                print(f"Error prefetching data for {asset}: {e}")
                 continue
 
         print("Data pre-fetch complete.")
@@ -318,32 +510,13 @@ class BacktestingMechanism(Mechanism):
             self._use_prefetched_market_data(first_date)
             print(f"Initial market data prepared for {first_date}")
 
-    async def form_agent_cohorts(self, agents: List[Any]) -> None:
-        """Form trading teams if cohorts enabled"""
-        if not self.form_cohorts:
-            return
-
-        self.cohorts.clear()
-        current_cohort = []
-        cohort_count = 1
-
-        for agent in agents:
-            current_cohort.append(agent)
-            if len(current_cohort) >= self.group_size:
-                self.cohorts[f"trading_team_{cohort_count}"] = current_cohort
-                current_cohort = []
-                cohort_count += 1
-
-        if current_cohort:
-            self.cohorts[f"trading_team_{cohort_count}"] = current_cohort
-
-    def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float) -> int:
+    def execute_trade(self, asset: str, action: str, quantity: float, current_price: float) -> int:
         """Execute trades with support for both long and short positions"""
         if quantity <= 0:
             return 0
 
         quantity = int(quantity)  # force integer shares
-        position = self.portfolio["positions"][ticker]
+        position = self.portfolio["positions"][asset]
 
         if action == "buy":
             cost = quantity * current_price
@@ -384,7 +557,7 @@ class BacktestingMechanism(Mechanism):
             if quantity > 0:
                 avg_cost_per_share = position["long_cost_basis"] if position["long"] > 0 else 0
                 realized_gain = (current_price - avg_cost_per_share) * quantity
-                self.portfolio["realized_gains"][ticker]["long"] += realized_gain
+                self.portfolio["realized_gains"][asset]["long"] += realized_gain
 
                 position["long"] -= quantity
                 self.portfolio["cash"] += quantity * current_price
@@ -457,7 +630,7 @@ class BacktestingMechanism(Mechanism):
                 self.portfolio["margin_used"] -= margin_to_release
                 self.portfolio["cash"] += margin_to_release
                 self.portfolio["cash"] -= cover_cost
-                self.portfolio["realized_gains"][ticker]["short"] += realized_gain
+                self.portfolio["realized_gains"][asset]["short"] += realized_gain
 
                 if position["short"] == 0:
                     position["short_cost_basis"] = 0.0
@@ -471,9 +644,9 @@ class BacktestingMechanism(Mechanism):
         """Calculate total portfolio value including cash and positions"""
         total_value = self.portfolio["cash"]
 
-        for ticker in self.tickers:
-            position = self.portfolio["positions"][ticker]
-            price = current_prices[ticker]
+        for asset in self.assets:
+            position = self.portfolio["positions"][asset]
+            price = current_prices[asset]
 
             # Long position value
             long_value = position["long"] * price
@@ -494,183 +667,208 @@ class BacktestingMechanism(Mechanism):
         if self.current_index >= len(self.dates):
             return self._create_step(done=True, cohort_id=cohort_id)
 
-        # Get current date and prices
+        # Get current date
         current_date = self.dates[self.current_index]
         current_date_str = current_date.strftime("%Y-%m-%d")
         
         # Use prefetched data for the current date
-        self._use_prefetched_market_data(current_date_str)
+        if cohort_id:
+            # Update market data only for this cohort's asset
+            self._use_prefetched_market_data(current_date_str, cohort_id)
+        else:
+            # Update all market data if no cohort specified
+            for asset in self.assets:
+                self._use_prefetched_market_data(current_date_str, asset)
 
-        # Use provided cohort_id or default
-        effective_cohort = cohort_id if cohort_id else "default"
-
-        # Process trades
+        # Handle single agent action
         if isinstance(action, LocalAction):
             action_dict = action.action
             try:
-                # Check if action is nested inside the action dictionary
-                if isinstance(action_dict, dict) and 'action' in action_dict and isinstance(action_dict['action'], dict):
-                    # Extract the inner action dictionary
+                if isinstance(action_dict, dict) and 'action' in action_dict:
                     trade_info = action_dict['action']
+                    validated_trade = TradeAction(**trade_info)
                     
-                    # Validate the trade information
-                    validated_trade = TradeAction(
-                        ticker=trade_info.get('ticker', ''),
-                        action=trade_info.get('action', 'hold'),
-                        quantity=float(trade_info.get('quantity', 0)),
-                        reason=trade_info.get('reason', '')
-                    )
-                elif isinstance(action_dict, dict) and 'Action' in action_dict and isinstance(action_dict['Action'], dict):
-                    # Handle the rich text format from log output
-                    inner_action = action_dict['Action']
-                    validated_trade = TradeAction(
-                        ticker=inner_action.get('Ticker', ''),
-                        action=inner_action.get('Action', 'hold'),
-                        quantity=float(inner_action.get('Quantity', 0)),
-                        reason=inner_action.get('Reason', '')
-                    )
-                else:
-                    # Direct validation of the action dictionary
-                    validated_trade = TradeAction.model_validate(action_dict)
-                
-                # Execute the trade
-                if validated_trade.ticker in self.market_data["prices"]:
-                    price = self.market_data["prices"][validated_trade.ticker]
-                    self.execute_trade(
-                        validated_trade.ticker, 
-                        validated_trade.action, 
-                        validated_trade.quantity, 
-                        price
-                    )
-                else:
-                    print(f"Warning: No price data for {validated_trade.ticker} on {current_date_str}")
-                    
-            except Exception as e:
-                print(f"Error validating trade action: {e}")
-                print(f"Debug - Action structure: {action_dict}")
-                
-            step = self._create_local_step(action.agent_id, done=False)
-            
-        else:  # GlobalAction
-            for agent_id, local_action in action.actions.items():
-                action_dict = local_action.action
-                
-                try:
-                    # Check if action is nested inside the action dictionary
-                    if isinstance(action_dict, dict) and 'action' in action_dict and isinstance(action_dict['action'], dict):
-                        # Extract the inner action dictionary
-                        trade_info = action_dict['action']
-                        
-                        # Validate the trade information
-                        validated_trade = TradeAction(
-                            ticker=trade_info.get('ticker', ''),
-                            action=trade_info.get('action', 'hold'),
-                            quantity=float(trade_info.get('quantity', 0)),
-                            reason=trade_info.get('reason', '')
-                        )
-                    elif isinstance(action_dict, dict) and 'Action' in action_dict and isinstance(action_dict['Action'], dict):
-                        # Handle the rich text format from log output
-                        inner_action = action_dict['Action']
-                        validated_trade = TradeAction(
-                            ticker=inner_action.get('Ticker', ''),
-                            action=inner_action.get('Action', 'hold'),
-                            quantity=float(inner_action.get('Quantity', 0)),
-                            reason=inner_action.get('Reason', '')
-                        )
-                    else:
-                        # Direct validation of the action dictionary
-                        validated_trade = TradeAction.model_validate(action_dict)
-                    
-                    # Execute the trade
-                    if validated_trade.ticker in self.market_data["prices"]:
-                        price = self.market_data["prices"][validated_trade.ticker]
+                    # Only execute trade if it matches the cohort's asset
+                    if cohort_id and validated_trade.asset == cohort_id:
+                        price = self.market_data["prices"][validated_trade.asset]
                         self.execute_trade(
-                            validated_trade.ticker, 
-                            validated_trade.action, 
-                            validated_trade.quantity, 
+                            validated_trade.asset,
+                            validated_trade.action,
+                            validated_trade.quantity,
                             price
                         )
-                    else:
-                        print(f"Warning: No price data for {validated_trade.ticker} on {current_date_str}")
-                        
-                except Exception as e:
-                    print(f"Error validating trade action for agent {agent_id}: {e}")
-                    print(f"Debug - Action structure for {agent_id}: {action_dict}")
-                    
-            step = self._create_step(done=False, cohort_id=cohort_id)
+            except Exception as e:
+                print(f"Error processing trade: {e}")
 
-        # Update portfolio value history
+            # Create observation for this agent
+            obs = self._create_observation(asset=cohort_id)
+            local_obs = BacktestLocalObservation(
+                agent_id=action.agent_id,
+                observation=obs
+            )
+            
+            local_step = LocalEnvironmentStep(
+                observation=local_obs,
+                done=False,
+                info={
+                    "date": current_date_str,
+                    "asset": cohort_id
+                }
+            )
+
+            # Only update portfolio metrics after processing all cohorts
+            if not cohort_id:
+                self._update_portfolio_and_metrics(current_date)
+                self.current_index += 1
+                
+            return local_step
+
+        # Handle global actions
+        else:
+            observations = {}
+            
+            for agent_id, local_action in action.actions.items():
+                action_dict = local_action.action
+                try:
+                    if isinstance(action_dict, dict) and 'action' in action_dict:
+                        trade_info = action_dict['action']
+                        validated_trade = TradeAction(**trade_info)
+                        
+                        # Only execute trade if it matches the cohort's asset
+                        if cohort_id and validated_trade.asset == cohort_id:
+                            price = self.market_data["prices"][validated_trade.asset]
+                            self.execute_trade(
+                                validated_trade.asset,
+                                validated_trade.action,
+                                validated_trade.quantity,
+                                price
+                            )
+                except Exception as e:
+                    print(f"Error processing trade for agent {agent_id}: {e}")
+
+                # Create observation for this agent
+                obs = self._create_observation(asset=cohort_id)
+                observations[agent_id] = BacktestLocalObservation(
+                    agent_id=agent_id,
+                    observation=obs
+                )
+
+            global_step = EnvironmentStep(
+                global_observation=BacktestGlobalObservation(
+                    observations=observations,
+                    all_actions_this_round=None
+                ),
+                done=False,
+                info={
+                    "date": current_date_str,
+                    "asset": cohort_id
+                }
+            )
+
+            # Only update portfolio metrics after processing all cohorts
+            if not cohort_id:
+                self._update_portfolio_and_metrics(current_date)
+                self.current_index += 1
+                
+            return global_step
+
+    def _update_portfolio_and_metrics(self, current_date):
+        """Helper method to update portfolio values and metrics"""
         total_value = self.calculate_portfolio_value(self.market_data["prices"])
         self.portfolio_values.append({
             "Date": current_date,
             "Portfolio Value": total_value
         })
-
-        # Update performance metrics
         self._update_performance_metrics()
 
-        # Move to next date
-        self.current_index += 1
-        return step
-
-    def _use_prefetched_market_data(self, current_date: str):
-        """Use the prefetched data for the current date"""
+    def _use_prefetched_market_data(self, current_date: str, cohort_id: Optional[str] = None):
+        """
+        Use the prefetched data for the current date
+        
+        Args:
+            current_date: Date to get data for
+            cohort_id: If specified, only update data for this asset/cohort
+        """
         prices = {}
         metrics = {}
         news = []
         
-        for ticker in self.tickers:
+        # If cohort_id is provided, only process that asset
+        assets_to_process = [cohort_id] if cohort_id else self.assets
+        
+        for asset in assets_to_process:
             try:
                 # Get price from cached data
-                if ticker in self.price_data:
-                    price_df = self.price_data[ticker]
+                if asset in self.price_data:
+                    price_df = self.price_data[asset]
                     
                     # Handle different date formats
                     try:
                         # Try exact string match
                         if current_date in price_df.index:
                             # Convert NumPy scalar to native Python float
-                            prices[ticker] = float(price_df.loc[current_date, 'Close'])
+                            prices[asset] = float(price_df.loc[current_date, 'Close'])
                         else:
                             # Try datetime index
                             date_obj = pd.to_datetime(current_date)
                             if date_obj in price_df.index:
                                 # Convert NumPy scalar to native Python float
-                                prices[ticker] = float(price_df.loc[date_obj, 'Close'])
+                                prices[asset] = float(price_df.loc[date_obj, 'Close'])
                             else:
                                 # Try next business day if needed
                                 next_date = price_df.index[price_df.index > date_obj]
                                 if not next_date.empty:
                                     # Convert NumPy scalar to native Python float
-                                    prices[ticker] = float(price_df.iloc[price_df.index.get_indexer([next_date[0]], method='nearest')[0]]['Close'])
+                                    prices[asset] = float(price_df.iloc[price_df.index.get_indexer([next_date[0]], method='nearest')[0]]['Close'])
                     except Exception as e:
                         # If date not found, log warning
-                        print(f"Error finding price for {ticker} on {current_date}: {e}")
+                        print(f"Error finding price for {asset} on {current_date}: {e}")
                         
                 # Get metrics from cached data
-                if ticker in self.fundamental_data:
+                if asset in self.fundamental_data:
                     # Convert any NumPy values to Python native types
-                    metrics[ticker] = self._convert_numpy_to_python(self.fundamental_data[ticker])
+                    metrics[asset] = self._convert_numpy_to_python(self.fundamental_data[asset])
                     
                 # Get news from cached data
-                if ticker in self.news_data:
+                if asset in self.news_data:
                     relevant_news = [
-                        n for n in self.news_data[ticker] 
+                        n for n in self.news_data[asset] 
                         if current_date in n.get('date', '')
                     ]
                     news.extend(relevant_news)
                     
             except Exception as e:
-                print(f"Error updating market data for {ticker}: {e}")
+                print(f"Error updating market data for {asset}: {e}")
                 continue
 
-        self.market_data = {
-            "date": current_date,
-            "prices": prices,
-            "metrics": metrics,
-            "news": news
-        }
-
+        # If cohort_id is provided, only update that asset's data in market_data
+        if cohort_id:
+            # Preserve other assets' data in market_data
+            if not hasattr(self, 'market_data') or not self.market_data:
+                self.market_data = {"date": current_date, "prices": {}, "metrics": {}, "news": []}
+            
+            # Update only the specified asset's data
+            self.market_data["date"] = current_date
+            
+            # More explicitly update just the specific asset's data
+            if cohort_id in prices:
+                self.market_data["prices"][cohort_id] = prices[cohort_id]
+            
+            if cohort_id in metrics:
+                self.market_data["metrics"][cohort_id] = metrics[cohort_id]
+            
+            # Filter news specific to this asset
+            asset_news = [n for n in news if n.get('asset') == cohort_id]
+            self.market_data["news"] = asset_news
+        else:
+            # Update all market data
+            self.market_data = {
+                "date": current_date,
+                "prices": prices,
+                "metrics": metrics,
+                "news": news
+            }
+            
     def _convert_numpy_to_python(self, obj):
         """Helper method to recursively convert NumPy types to Python native types"""
         import numpy as np
@@ -739,81 +937,67 @@ class BacktestingMechanism(Mechanism):
                 self.performance_metrics["max_drawdown"] = 0.0
                 self.performance_metrics["max_drawdown_date"] = None
 
-    def _create_observation(self) -> BacktestObservation:
-        """Create observation from current state"""
-        return BacktestObservation(
-            market_data=MarketData(**self.market_data),
-            portfolio=PortfolioState(**self.portfolio),
-            performance_metrics=self.performance_metrics
-        )
-
-    def _create_local_step(self, agent_id: str, done: bool) -> LocalEnvironmentStep:
-        """Create a local step for single agent"""
-        obs = self._create_observation()
-        return LocalEnvironmentStep(
-            observation=BacktestLocalObservation(
-                agent_id=agent_id,
-                observation=obs
-            ),
-            done=done,
-            info={"date": self.market_data["date"]}
-        )
-
-    def _create_step(self, done: bool, cohort_id: Optional[str] = None) -> EnvironmentStep:
-        """Create a global step"""
-        obs = self._create_observation()
-        observations = {}
-        
-        # Get relevant agents based on cohort
-        if cohort_id and cohort_id in self.cohorts:
-            agents = self.cohorts[cohort_id]
-            
-            # Create observation for each agent in the cohort
-            for agent in agents:
-                observations[agent.id] = BacktestLocalObservation(
-                    agent_id=agent.id,
-                    observation=obs
-                )
-        else:
-            # If no cohort information or agents are available directly,
-            pass
-
-        return EnvironmentStep(
-            global_observation=BacktestGlobalObservation(
-                observations=observations,
-                all_actions_this_round=None
-            ),
-            done=done,
-            info={"date": self.market_data["date"]}
-        )
 
     def get_global_state(self, agent_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get the current global state with JSON-serializable values"""
-        # Create the state dictionary
-        state = {
-            "current_date": self.dates[self.current_index].strftime("%Y-%m-%d") if self.current_index < len(self.dates) else None,
-            "portfolio": self._convert_to_serializable(self.portfolio),
-            "market_data": self._convert_to_serializable(self.market_data),
-            "portfolio_values": self._convert_to_serializable(self.portfolio_values[-5:]),
-            "performance_metrics": self._convert_to_serializable(self.performance_metrics)
-        }
+        """Get the current global state with asset-specific data"""
+        # Find the agent's cohort/asset
+        cohort_id = next(
+            (cid for cid, agents in self.cohorts.items() 
+            if any(a.id == agent_id for a in agents)),
+            None
+        )
         
-        if self.form_cohorts:
-            # Add cohort-specific information
-            if agent_id:
-                cohort_id = next(
-                    (cid for cid, agents in self.cohorts.items() 
-                    if any(a.id == agent_id for a in agents)),
-                    None
-                )
-                if cohort_id:
-                    state["cohort_id"] = cohort_id
-                    state["cohort_agents"] = [a.id for a in self.cohorts[cohort_id]]
-            else:
-                state["cohorts"] = {
+        # Filter data based on cohort/asset
+        if cohort_id and cohort_id in self.assets:
+            asset = cohort_id  # Since cohort_id is the asset symbol
+            state = {
+                "current_date": self.dates[self.current_index].strftime("%Y-%m-%d") if self.current_index < len(self.dates) else None,
+                "portfolio": {
+                    "cash": self.portfolio["cash"],  # Cash is shared
+                    "margin_used": self.portfolio["margin_used"],
+                    "margin_requirement": self.portfolio["margin_requirement"],
+                    "positions": {
+                        asset: self._convert_to_serializable(self.portfolio["positions"][asset])
+                    },
+                    "realized_gains": {
+                        asset: self._convert_to_serializable(self.portfolio["realized_gains"][asset])
+                    }
+                },
+                "market_data": {
+                    "date": self.market_data["date"],
+                    "prices": {asset: self._convert_to_serializable(self.market_data["prices"].get(asset))},
+                    "metrics": {asset: self._convert_to_serializable(self.market_data["metrics"].get(asset))},
+                    "news": [n for n in self.market_data["news"] if n.get('asset') == asset]
+                },
+                "portfolio_values": [
+                    {
+                        "Date": pv["Date"],
+                        "Portfolio Value": pv["Portfolio Value"],
+                        "Asset Positions": {
+                            asset: pv.get("Asset Positions", {}).get(asset, {})
+                        }
+                    } for pv in self.portfolio_values[-5:]
+                ],
+                "performance_metrics": {
+                    asset: self._convert_to_serializable(self.performance_metrics.get(asset, {}))
+                },
+                "cohort_id": cohort_id,
+                "cohort_agents": [a.id for a in self.cohorts[cohort_id]]
+            }
+        else:
+            # Return full state only if no agent_id or cohort_id provided
+            # This is typically only used by the orchestrator
+            state = {
+                "current_date": self.dates[self.current_index].strftime("%Y-%m-%d") if self.current_index < len(self.dates) else None,
+                "portfolio": self._convert_to_serializable(self.portfolio),
+                "market_data": self._convert_to_serializable(self.market_data),
+                "portfolio_values": self._convert_to_serializable(self.portfolio_values[-5:]),
+                "performance_metrics": self._convert_to_serializable(self.performance_metrics),
+                "cohorts": {
                     cid: [a.id for a in agents] 
                     for cid, agents in self.cohorts.items()
                 }
+            }
         
         return state
 
@@ -887,7 +1071,7 @@ class BacktestingEnvironment(MultiAgentEnvironment):
             
             # Initialize mechanism with config parameters
             mechanism = BacktestingMechanism(
-                tickers=env_config.tickers,
+                assets=env_config.assets,
                 start_date=env_config.start_date,
                 end_date=env_config.end_date,
                 initial_capital=env_config.initial_capital,

@@ -228,16 +228,16 @@ async def create_backtesting_hedge_fund_team(
     backtesting_env = {
         "name": "backtesting",
         "mechanism": "backtesting",
-        "tickers": tickers,
+        "assets": tickers,
         "start_date": start_date,
         "end_date": end_date,
         "initial_capital": initial_capital,
         "margin_requirement": 0.5,
-        "form_cohorts": False,
+        "form_cohorts": True,
         "sub_rounds": 2,
         "group_size": 5,
         "task_prompt": "",
-        "mcp_server_module": "market_agents.orchestrators.mcp_server.finance_mcp_server",  # For data fetching
+        "mcp_server_module": "market_agents.orchestrators.mcp_server.finance_mcp_server",
     }
 
     # Create the hedge fund team with backtesting environment
