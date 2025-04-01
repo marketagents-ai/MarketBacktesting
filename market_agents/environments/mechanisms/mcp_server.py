@@ -314,7 +314,7 @@ class MCPServerMechanism(Mechanism):
                 if "unhandled errors in a TaskGroup" not in str(e):
                     last_error = e
                 else:
-                    return None
+                    return result
 
             retry_count += 1
             if retry_count < max_retries:
