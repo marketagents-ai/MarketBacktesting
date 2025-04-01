@@ -57,7 +57,7 @@ class ShortTermMemory(BaseModel):
 
     async def retrieve_recent_memories(
         self,
-        limit: int = 5,
+        limit: Optional[int] = None,
         cognitive_step: Optional[str] = None,
         metadata_filters: Optional[Dict] = None,
         start_time: Optional[datetime] = None,
@@ -165,7 +165,7 @@ class LongTermMemory(BaseModel):
         self,
         agent_id: str,
         query: str,
-        top_k: int = 5
+        top_k: Optional[int] = None
     ) -> List[EpisodicMemoryObject]:
         """Retrieve episodic memories using semantic search."""
         retrieved = await self.agent_storage_utils.get_episodic_memory_vector(
@@ -226,7 +226,7 @@ class LongTermMemory(BaseModel):
     async def get_episodic_memories(
         self,
         agent_id: str,
-        limit: int = 10,
+        limit: int = 5,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         metadata_filters: Optional[Dict[str, Any]] = None
