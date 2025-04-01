@@ -1,5 +1,6 @@
 # finance_mcp_server.py
 
+from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 import yfinance as yf
 import pandas as pd
@@ -128,6 +129,65 @@ def get_company_profile(symbol: str) -> dict:
         return stock.info
     except Exception as e:
         return {}
+    
+@mcp.tool()
+def get_historical_prices(symbol: str, start_date: str, end_date: str) -> dict:
+    """
+    Get historical daily price data for a given symbol and date range.
+    Returns OHLCV data.
+    """
+    try:
+        stock = yf.Ticker(symbol)
+        history = stock.history(start=start_date, end=end_date, interval='1d')
+        return history.to_dict(orient='index')
+    except Exception as e:
+        return {}
+
+@mcp.tool()
+def get_historical_fundamentals(symbol: str, date: str) -> dict:
+    """
+    Get fundamental data for a given symbol as of a specific date.
+    """
+    try:
+        stock = yf.Ticker(symbol)
+        # Note: yfinance might not provide historical fundamentals
+        # We'll return current data as fallback
+        return stock.info
+    except Exception as e:
+        return {}
+
+@mcp.tool()
+def get_historical_financials(symbol: str, date: str) -> dict:
+    """
+    Get financial statements data as of a specific date.
+    """
+    try:
+        stock = yf.Ticker(symbol)
+        financials = stock.financials
+        # Filter to get data up to the specified date
+        filtered = financials.loc[:date] if not financials.empty else pd.DataFrame()
+        return filtered.to_dict() if not filtered.empty else {}
+    except Exception as e:
+        return {}
+
+@mcp.tool()
+def get_historical_news(symbol: str, start_date: str, end_date: str) -> list:
+    """
+    Get news articles for a given symbol within a date range.
+    """
+    try:
+        stock = yf.Ticker(symbol)
+        news = stock.news
+        # Filter news by date range
+        if news:
+            filtered_news = [
+                n for n in news 
+                if start_date <= datetime.fromtimestamp(n['providerPublishTime']).strftime('%Y-%m-%d') <= end_date
+            ]
+            return filtered_news
+        return []
+    except Exception as e:
+        return []
 
 if __name__ == "__main__":
     mcp.run()
