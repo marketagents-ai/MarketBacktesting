@@ -1,3 +1,4 @@
+from market_agents.verbal_rl.reward_functions.backtest_reward_function import BacktestRewardFunction
 from market_agents.agents.market_agent import MarketAgent
 from market_agents.orchestrators.market_agent_team import MarketAgentTeam
 from market_agents.memory.agent_storage.agent_storage_api_utils import AgentStorageAPIUtils
@@ -20,6 +21,13 @@ async def create_backtesting_hedge_fund_team(
     # Load storage config
     storage_config = load_config_from_yaml("market_agents/memory/storage_config.yaml")
     storage_utils = AgentStorageAPIUtils(config=storage_config)
+
+    # Create custom reward function with higher economic weight
+    backtest_reward_fn = BacktestRewardFunction(
+        environment_weight=0.2,
+        self_eval_weight=0.3,
+        economic_weight=0.5
+    )
 
     # Create Portfolio Manager Persona
     portfolio_manager_persona = Persona(
@@ -61,7 +69,8 @@ async def create_backtesting_hedge_fund_team(
         econ_agent=EconomicAgent(
             generate_wallet=True,
             initial_holdings={"USDC": initial_capital}
-        )
+        ),
+        reward_function=backtest_reward_fn
     )
 
     # Create Fundamental Analyst Persona
@@ -100,7 +109,8 @@ async def create_backtesting_hedge_fund_team(
             temperature=0.2,
             use_cache=True
         ),
-        persona=fundamental_analyst_persona
+        persona=fundamental_analyst_persona,
+        reward_function=backtest_reward_fn
     )
 
     # Create Technical Analyst Persona
@@ -139,7 +149,8 @@ async def create_backtesting_hedge_fund_team(
             temperature=0.2,
             use_cache=True
         ),
-        persona=technical_analyst_persona
+        persona=technical_analyst_persona,
+        reward_function=backtest_reward_fn
     )
 
     # Create Macro Analyst Persona
@@ -178,7 +189,8 @@ async def create_backtesting_hedge_fund_team(
             temperature=0.2,
             use_cache=True
         ),
-        persona=macro_analyst_persona
+        persona=macro_analyst_persona,
+        reward_function=backtest_reward_fn
     )
 
     # Create Risk Analyst Persona
@@ -217,7 +229,8 @@ async def create_backtesting_hedge_fund_team(
             temperature=0.2,
             use_cache=True
         ),
-        persona=risk_analyst_persona
+        persona=risk_analyst_persona,
+        reward_function=backtest_reward_fn
     )
     
     # Load storage config
@@ -233,7 +246,7 @@ async def create_backtesting_hedge_fund_team(
         "end_date": end_date,
         "initial_capital": initial_capital,
         "margin_requirement": 0.5,
-        "form_cohorts": True,
+        "form_cohorts": False,
         "sub_rounds": 2,
         "group_size": 5,
         "task_prompt": "",
@@ -329,7 +342,7 @@ async def run_backtest_analysis(team: MarketAgentTeam, current_date: str):
 
 async def main():
     # Define backtest parameters
-    tickers = ["NVDA", "AAPL"]
+    tickers = ["NVDA"]
     start_date = "2023-05-01"
     end_date = "2023-07-01"
     initial_capital = 10_000_000.0
