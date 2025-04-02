@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Dict, Any, List, Optional, Union, Type
 from market_agents.agents.market_agent import MarketAgent
 from market_agents.orchestrators.logger_utils import log_cohort_formation
@@ -45,13 +46,26 @@ class BacktestingEnvironmentConfig(EnvironmentConfig):
         "extra": "allow"
     }
 
-# Trade action schema
+class TradeActionType(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+    SHORT = "short"
+    COVER = "cover"
+    HOLD = "hold"
+
 class TradeAction(BaseModel):
     """Schema for trade actions"""
     asset: str = Field(..., description="The asset symbol to trade")
-    action: str = Field(..., description="Trade action: buy, sell, short, or cover")
+    action: TradeActionType = Field(
+        ..., 
+        description="Trade action type: buy, sell, short, cover, or hold",
+        examples=["buy", "sell", "short", "cover", "hold"]
+    )
     quantity: float = Field(..., description="Number of shares to trade")
     reason: str = Field(default="", description="Reasoning behind the trade")
+    
+    class Config:
+        use_enum_values = True  
 
 class BacktestAction(LocalAction):
     """Local action for a single agent in backtesting"""
@@ -86,9 +100,13 @@ class MarketData(BaseModel):
 
 class BacktestObservation(BaseModel):
     """Observation containing market data and portfolio state"""
-    market_data: MarketData
     portfolio: PortfolioState
-    performance_metrics: Dict[str, float] = Field(default_factory=dict)
+    performance_metrics: Dict[str, Any] = Field(default_factory=dict)
+    
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "extra": "allow"
+    }
 
 class BacktestLocalObservation(LocalObservation):
     """Local observation for a single agent"""
@@ -398,39 +416,53 @@ class BacktestingMechanism(Mechanism):
             logger.info(f"  {asset}: {agent_ids}")
 
     def _create_observation(self, asset: Optional[str] = None) -> BacktestObservation:
-        """Create observation from current state, filtered by asset"""
+        """
+        Create a minimal observation focused only on portfolio state and performance metrics
+        that resulted from the agent's last action.
+        """
         if asset:
-            # Filter market data for specific asset
-            filtered_market_data = {
-                "date": self.market_data["date"],
-                "prices": {asset: self.market_data["prices"].get(asset)},
-                "metrics": {asset: self.market_data["metrics"].get(asset)},
-                "news": [n for n in self.market_data["news"] if n.get('asset') == asset]
-            }
+            # For asset-specific agents, include only portfolio state and performance for their asset
+            position = self.portfolio["positions"][asset]
+            price = self.market_data["prices"].get(asset, 0.0)
             
-            # Filter portfolio data for specific asset
-            filtered_portfolio = {
-                "cash": self.portfolio["cash"],  # Cash is shared across all assets
-                "margin_requirement": self.portfolio["margin_requirement"],
-                "margin_used": self.portfolio["margin_used"],
+            # Asset-specific portfolio information - only what changed from the action
+            portfolio_state = {
+                "cash": self.portfolio["cash"],
                 "positions": {
                     asset: self.portfolio["positions"][asset]
                 },
+                "margin_used": self.portfolio["margin_used"],
                 "realized_gains": {
                     asset: self.portfolio["realized_gains"][asset]
                 }
             }
             
+            # Only performance metrics that reflect action results
+            performance_metrics = self._convert_to_serializable(self.performance_metrics.get(asset, {}))
+            
+            # Include portfolio value change
+            if len(self.portfolio_values) >= 2:
+                performance_metrics["portfolio_value"] = self.portfolio_values[-1]["Portfolio Value"]
+            
             return BacktestObservation(
-                market_data=MarketData(**filtered_market_data),
-                portfolio=PortfolioState(**filtered_portfolio),
-                performance_metrics={asset: self.performance_metrics[asset]}
+                portfolio=PortfolioState(**portfolio_state),
+                performance_metrics=performance_metrics
             )
         else:
+            # Global observation - even more minimal
+            
+            portfolio_state = {
+                "cash": self.portfolio["cash"],
+                "positions": self.portfolio["positions"],
+                "margin_used": self.portfolio["margin_used"],
+                "realized_gains": self.portfolio["realized_gains"]
+            }
+            
+            performance_metrics = self._convert_to_serializable(self.performance_metrics.get(asset, {}))
+            
             return BacktestObservation(
-                market_data=MarketData(**self.market_data),
-                portfolio=PortfolioState(**self.portfolio),
-                performance_metrics=self.performance_metrics
+                portfolio=PortfolioState(**portfolio_state),
+                performance_metrics=performance_metrics
             )
 
     def _create_step(self, done: bool, cohort_id: Optional[str] = None) -> EnvironmentStep:
@@ -774,11 +806,41 @@ class BacktestingMechanism(Mechanism):
 
     def _update_portfolio_and_metrics(self, current_date):
         """Helper method to update portfolio values and metrics"""
+        # Calculate current portfolio value
         total_value = self.calculate_portfolio_value(self.market_data["prices"])
-        self.portfolio_values.append({
+        
+        # Calculate daily return if we have previous value
+        daily_return = 0.0
+        previous_value = None
+        
+        if len(self.portfolio_values) > 0:
+            previous_value = self.portfolio_values[-1]["Portfolio Value"]
+            if previous_value > 0:
+                daily_return = (total_value - previous_value) / previous_value
+        
+        # Add daily return to portfolio values
+        portfolio_entry = {
             "Date": current_date,
-            "Portfolio Value": total_value
-        })
+            "Portfolio Value": total_value,
+            "Daily Return": daily_return
+        }
+        
+        # Print detailed performance info
+        print(f"\n=== PORTFOLIO UPDATE ===")
+        print(f"Date: {current_date.strftime('%Y-%m-%d')}")
+        print(f"Portfolio Value: ${total_value:,.2f}")
+        print(f"Daily Return: {daily_return:.4f} ({daily_return*100:.2f}%)")
+        
+        # Add to portfolio values history
+        self.portfolio_values.append(portfolio_entry)
+        
+        # Add daily return to performance metrics (for each asset)
+        for asset in self.assets:
+            if asset not in self.performance_metrics:
+                self.performance_metrics[asset] = {}
+            self.performance_metrics[asset]["daily_return"] = daily_return
+        
+        # Update other performance metrics
         self._update_performance_metrics()
 
     def _use_prefetched_market_data(self, current_date: str, cohort_id: Optional[str] = None):
@@ -947,13 +1009,29 @@ class BacktestingMechanism(Mechanism):
             None
         )
         
+        # Calculate portfolio returns
+        daily_return = 0.0
+        total_return = 0.0
+        current_value = 0.0
+        
+        if len(self.portfolio_values) >= 2:
+            current_value = self.portfolio_values[-1]["Portfolio Value"]
+            previous_value = self.portfolio_values[-2]["Portfolio Value"]
+            initial_value = self.portfolio_values[0]["Portfolio Value"]
+            
+            if previous_value > 0:
+                daily_return = (current_value - previous_value) / previous_value
+            
+            if initial_value > 0:
+                total_return = (current_value / initial_value - 1.0)
+        
         # Filter data based on cohort/asset
         if cohort_id and cohort_id in self.assets:
-            asset = cohort_id  # Since cohort_id is the asset symbol
+            asset = cohort_id
             state = {
                 "current_date": self.dates[self.current_index].strftime("%Y-%m-%d") if self.current_index < len(self.dates) else None,
                 "portfolio": {
-                    "cash": self.portfolio["cash"],  # Cash is shared
+                    "cash": self.portfolio["cash"],
                     "margin_used": self.portfolio["margin_used"],
                     "margin_requirement": self.portfolio["margin_requirement"],
                     "positions": {
@@ -973,26 +1051,22 @@ class BacktestingMechanism(Mechanism):
                     {
                         "Date": pv["Date"],
                         "Portfolio Value": pv["Portfolio Value"],
+                        "Daily Return": pv.get("Daily Return", 0.0),
                         "Asset Positions": {
                             asset: pv.get("Asset Positions", {}).get(asset, {})
                         }
                     } for pv in self.portfolio_values[-5:]
                 ],
-                "performance_metrics": {
-                    asset: self._convert_to_serializable(self.performance_metrics.get(asset, {}))
-                },
                 "cohort_id": cohort_id,
                 "cohort_agents": [a.id for a in self.cohorts[cohort_id]]
             }
         else:
             # Return full state only if no agent_id or cohort_id provided
-            # This is typically only used by the orchestrator
             state = {
                 "current_date": self.dates[self.current_index].strftime("%Y-%m-%d") if self.current_index < len(self.dates) else None,
                 "portfolio": self._convert_to_serializable(self.portfolio),
                 "market_data": self._convert_to_serializable(self.market_data),
                 "portfolio_values": self._convert_to_serializable(self.portfolio_values[-5:]),
-                "performance_metrics": self._convert_to_serializable(self.performance_metrics),
                 "cohorts": {
                     cid: [a.id for a in agents] 
                     for cid, agents in self.cohorts.items()
